@@ -30,6 +30,7 @@ export default function App() {
   const [showUserList, setShowUserList] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [audioSuspended, setAudioSuspended] = useState(false);
 
   const socketRef = useRef<Socket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -47,9 +48,15 @@ export default function App() {
       setUsername(username);
     });
 
-    socketRef.current.on("joined-room", ({ roomKey, username }) => {
+    socketRef.current.on("joined-room", ({ roomKey, username, audioState }) => {
       setRoomKey(roomKey);
       setUsername(username);
+      if (audioState) {
+        setAudioUrl(audioState.audioUrl);
+        if (audioState.playing) {
+          handleRemotePlay(audioState.audioUrl, audioState.startTime, audioState.offset, !!audioState.loop);
+        }
+      }
     });
 
     socketRef.current.on("room-lock-status", (status) => setIsLocked(status));
@@ -79,8 +86,18 @@ export default function App() {
     const syncInterval = setInterval(syncClock, 5000);
     syncClock();
 
+    // Monitor audio context state
+    const stateInterval = setInterval(() => {
+      if (audioContextRef.current?.state === "suspended") {
+        setAudioSuspended(true);
+      } else if (audioContextRef.current?.state === "running") {
+        setAudioSuspended(false);
+      }
+    }, 1000);
+
     return () => {
       clearInterval(syncInterval);
+      clearInterval(stateInterval);
       socketRef.current?.disconnect();
     };
   }, []);
@@ -100,14 +117,19 @@ export default function App() {
 
   const getServerTime = () => Date.now() + serverOffsetRef.current;
 
-  const initAudio = () => {
+  const initAudio = async () => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
     }
+    if (audioContextRef.current.state === "suspended") {
+      await audioContextRef.current.resume();
+    }
+    setAudioSuspended(false);
   };
 
   const loadAudio = async (url: string) => {
     initAudio();
+    console.log(`Loading audio from: ${url}`);
     setSyncStatus("Loading Audio...");
     try {
       const response = await fetch(url);
@@ -119,7 +141,7 @@ export default function App() {
       return audioBuffer;
     } catch (err) {
       console.error("Audio Load Error:", err);
-      setError("Failed to load audio. Note: YouTube/Freefy links are proxied but can be blocked by their servers. Try a direct MP3 link if it fails.");
+      setError("Failed to load audio. Please ensure the file is a valid audio format.");
       setSyncStatus("Load Failed");
       return null;
     }
@@ -161,6 +183,7 @@ export default function App() {
   };
 
   const handleRemotePlay = async (url: string, startTime: number, offset: number, loop: boolean) => {
+    setAudioUrl(url);
     const finalUrl = url.startsWith("/") ? `${window.location.origin}${url}` : url;
     const buffer = await loadAudio(finalUrl);
     if (buffer) playAudio(buffer, startTime, offset, loop);
@@ -178,33 +201,32 @@ export default function App() {
   };
 
   const createRoom = () => {
+    initAudio();
     setRole("main");
     socketRef.current?.emit("create-room", username);
   };
 
   const joinRoom = () => {
     if (!inputRoomKey) return;
+    initAudio();
     setRole("client");
     socketRef.current?.emit("join-room", { roomKey: inputRoomKey, username });
   };
 
   const toggleLock = () => socketRef.current?.emit("lock-room", roomKey);
 
+  const requestSync = () => {
+    setSyncStatus("Requesting Sync...");
+    socketRef.current?.emit("request-sync", roomKey);
+  };
+
   const killUser = (targetId: string) => {
     socketRef.current?.emit("kill-user", { roomKey, targetId });
   };
 
-  const hostPlay = async () => {
+  const hostPlay = () => {
     if (!audioUrl) return;
-    let finalUrl = audioUrl;
-    if (audioUrl.includes("youtube.com") || audioUrl.includes("youtu.be") || audioUrl.includes("freefy.app")) {
-      finalUrl = `/api/stream/audio?url=${encodeURIComponent(audioUrl)}`;
-    }
-    const buffer = await loadAudio(finalUrl);
-    if (buffer) {
-      const startTime = getServerTime() + 2000;
-      socketRef.current?.emit("play-audio", { roomKey, audioUrl: finalUrl, startTime, offset: 0, loop: isLooping });
-    }
+    socketRef.current?.emit("play-audio", { roomKey, audioUrl, offset: 0, loop: isLooping });
   };
 
   const hostPause = () => socketRef.current?.emit("pause-audio", roomKey);
@@ -212,8 +234,7 @@ export default function App() {
   const hostSeek = (newOffset: number) => {
     const duration = audioBufferRef.current?.duration || 0;
     const clampedOffset = Math.max(0, Math.min(newOffset, duration));
-    const startTime = getServerTime() + 500;
-    socketRef.current?.emit("seek-audio", { roomKey, offset: clampedOffset, startTime, loop: isLooping });
+    socketRef.current?.emit("seek-audio", { roomKey, offset: clampedOffset, loop: isLooping });
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -229,6 +250,8 @@ export default function App() {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", "/api/upload", true);
       
+      xhr.timeout = 600000; // 10 minutes
+      
       xhr.upload.onprogress = (event) => {
         if (event.lengthComputable) {
           const percentComplete = (event.loaded / event.total) * 100;
@@ -238,17 +261,32 @@ export default function App() {
 
       xhr.onload = () => {
         if (xhr.status === 200) {
-          const data = JSON.parse(xhr.responseText);
-          setAudioUrl(data.url);
-          setUploading(false);
+          try {
+            const data = JSON.parse(xhr.responseText);
+            setAudioUrl(data.url);
+            setUploading(false);
+          } catch (e) {
+            setError("Server returned invalid response.");
+            setUploading(false);
+          }
         } else {
-          setError("Failed to upload file.");
+          try {
+            const data = JSON.parse(xhr.responseText);
+            setError(data.error || "Failed to upload file.");
+          } catch (e) {
+            setError(`Upload failed with status: ${xhr.status}`);
+          }
           setUploading(false);
         }
       };
 
       xhr.onerror = () => {
-        setError("Failed to upload file.");
+        setError("Network error during upload. Check your connection.");
+        setUploading(false);
+      };
+
+      xhr.ontimeout = () => {
+        setError("Upload timed out. The file might be too large for your current connection.");
         setUploading(false);
       };
 
@@ -267,8 +305,7 @@ export default function App() {
       // Re-emit with current offset to update all clients' loop state
       const elapsed = (getServerTime() - lastPlayTimeRef.current) / 1000;
       const currentOffset = currentOffsetRef.current + elapsed;
-      const startTime = getServerTime() + 500;
-      socketRef.current?.emit("seek-audio", { roomKey, offset: currentOffset, startTime, loop: nextLoop });
+      socketRef.current?.emit("seek-audio", { roomKey, offset: currentOffset, loop: nextLoop });
     }
   };
 
@@ -376,26 +413,22 @@ export default function App() {
               <label className={BRUTAL_CLASSES.label}>Audio Source</label>
               {role === "main" ? (
                 <div className="space-y-4 mb-4">
-                  <div className="flex gap-2">
-                    <input 
-                      type="text" 
-                      placeholder="YouTube URL or Direct MP3 link" 
-                      className={BRUTAL_CLASSES.input + " mb-0"}
-                      value={audioUrl}
-                      onChange={(e) => setAudioUrl(e.target.value)}
-                    />
-                  </div>
                   <div className="flex items-center gap-4">
-                    <label className={`${BRUTAL_CLASSES.button} cursor-pointer flex-grow justify-center`}>
-                      <Upload size={16} /> {uploading ? "Uploading..." : "Upload from Device"}
+                    <label className={`${BRUTAL_CLASSES.button} cursor-pointer flex-grow justify-center h-16 text-xl`}>
+                      <Upload size={24} /> {uploading ? "Uploading..." : "Upload from Device"}
                       <input type="file" accept="audio/*" className="hidden" onChange={handleFileUpload} disabled={uploading} />
                     </label>
                   </div>
+                  {audioUrl && (
+                    <div className="text-xs font-bold truncate border-b border-[#141414] pb-2">
+                      FILE: {audioUrl.split('/').pop()?.split('-').slice(1).join('-')}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="mb-4 font-bold flex items-center gap-2">
                   <Music size={16} />
-                  {audioUrl ? audioUrl.split('/').pop() : "Waiting for Host..."}
+                  {audioUrl ? audioUrl.split('/').pop()?.split('-').slice(1).join('-') : "Waiting for Host..."}
                 </div>
               )}
 
@@ -426,6 +459,9 @@ export default function App() {
                         {isPlaying ? <Activity className="animate-pulse" /> : <Pause />}
                         <span className="text-xs uppercase font-bold">{isPlaying ? "Playing In Sync" : "Paused"}</span>
                       </div>
+                      <button onClick={requestSync} className={BRUTAL_CLASSES.button + " text-[10px] py-1"} title="Re-sync with Host">
+                        <RotateCcw size={14} /> Sync
+                      </button>
                       {isLooping && <div className="text-[10px] bg-[#141414] text-white px-2 py-1 uppercase font-bold">Loop Active</div>}
                     </div>
                   )}
@@ -496,6 +532,20 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        {/* Audio Context Resume Overlay */}
+        {audioSuspended && role !== "none" && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center z-[100] p-4">
+            <div className={`${BRUTAL_CLASSES.card} text-center max-w-sm bg-white`}>
+              <Music size={48} className="mx-auto mb-4 animate-bounce" />
+              <h2 className="text-2xl font-black uppercase mb-2">Audio Blocked</h2>
+              <p className="text-sm font-bold mb-6">Browsers block audio until you interact. Click below to enable synchronized playback.</p>
+              <button onClick={initAudio} className={BRUTAL_CLASSES.button + " w-full justify-center py-4 text-xl"}>
+                <Activity size={24} /> Enable Audio Sync
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* User List Modal */}
         {showUserList && (

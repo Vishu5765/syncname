@@ -3,14 +3,16 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import ytdl from "@distube/ytdl-core";
 import multer from "multer";
 import fs from "fs";
-import { Readable } from "stream";
 
 async function startServer() {
   const app = express();
   const httpServer = createServer(app);
+  // Increase server timeouts for large file uploads
+  httpServer.timeout = 600000; // 10 minutes
+  httpServer.keepAliveTimeout = 600000;
+
   const io = new Server(httpServer, {
     cors: {
       origin: "*",
@@ -33,66 +35,36 @@ async function startServer() {
       cb(null, Date.now() + "-" + file.originalname);
     },
   });
-  const upload = multer({ storage });
+
+  // Increase limit to 100MB for robust uploads
+  const upload = multer({ 
+    storage,
+    limits: { fileSize: 100 * 1024 * 1024 } 
+  });
 
   // Serve static files from public
   app.use("/uploads", express.static(uploadsDir));
 
   // File Upload Endpoint
-  app.post("/api/upload", upload.single("audio"), (req, res) => {
-    const file = (req as any).file;
-    if (!file) return res.status(400).send("No file uploaded");
-    const fileUrl = `/uploads/${file.filename}`;
-    res.json({ url: fileUrl });
-  });
-
-  // Audio Proxy (YouTube, Freefy, etc.)
-  app.get("/api/stream/audio", async (req, res) => {
-    const url = req.query.url as string;
-    if (!url) return res.status(400).send("No URL provided");
-    
-    console.log(`Attempting to stream audio: ${url}`);
-    
-    try {
-      if (url.includes("youtube.com") || url.includes("youtu.be")) {
-        if (!ytdl.validateURL(url)) {
-          return res.status(400).send("Invalid YouTube URL");
-        }
-
-        res.setHeader("Content-Type", "audio/mpeg");
-        res.setHeader("Transfer-Encoding", "chunked");
-
-        const stream = ytdl(url, { 
-          filter: "audioonly", 
-          quality: "highestaudio",
-          highWaterMark: 1 << 25 // 32MB buffer to prevent stuttering
-        });
-
-        stream.on("error", (err) => {
-          console.error("ytdl stream error:", err);
-          if (!res.headersSent) res.status(500).send("Stream error");
-        });
-
-        stream.pipe(res);
-      } else {
-        // General proxy for other audio sources (Freefy, direct links, etc.)
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-        
-        const contentType = response.headers.get("content-type");
-        if (contentType) res.setHeader("Content-Type", contentType);
-        
-        if (response.body) {
-          // @ts-ignore
-          Readable.fromWeb(response.body).pipe(res);
-        } else {
-          res.status(500).send("Empty response body");
-        }
+  app.post("/api/upload", (req, res) => {
+    upload.single("audio")(req, res, (err) => {
+      if (err instanceof multer.MulterError) {
+        console.error("Multer Error:", err);
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
+      } else if (err) {
+        console.error("Unknown Upload Error:", err);
+        return res.status(500).json({ error: "Unknown upload error" });
       }
-    } catch (err) {
-      console.error("Audio Proxy Error:", err);
-      if (!res.headersSent) res.status(500).send("Failed to stream audio");
-    }
+
+      const file = (req as any).file;
+      if (!file) {
+        return res.status(400).json({ error: "No file uploaded" });
+      }
+
+      console.log(`File uploaded successfully: ${file.filename} (${file.size} bytes)`);
+      const fileUrl = `/uploads/${file.filename}`;
+      res.json({ url: fileUrl });
+    });
   });
 
   // Room storage
@@ -153,7 +125,11 @@ async function startServer() {
       }
       room.users.set(socket.id, username || `User-${socket.id.slice(0, 4)}`);
       socket.join(roomKey);
-      socket.emit("joined-room", { roomKey, username: room.users.get(socket.id) });
+      socket.emit("joined-room", { 
+        roomKey, 
+        username: room.users.get(socket.id),
+        audioState: room.audioState 
+      });
       io.to(roomKey).emit("user-list", Array.from(room.users.entries()));
       console.log(`User ${username} joined room ${roomKey}`);
     });
@@ -182,14 +158,11 @@ async function startServer() {
     });
 
     // Audio Sync Events
-    socket.on("play-audio", ({ roomKey, audioUrl, startTime, offset, loop }) => {
+    socket.on("play-audio", ({ roomKey, audioUrl, offset, loop }) => {
       const room = rooms.get(roomKey);
       if (room && room.hostId === socket.id) {
-        let finalUrl = audioUrl;
-        if (audioUrl.includes("youtube.com") || audioUrl.includes("youtu.be") || audioUrl.includes("freefy.app")) {
-          finalUrl = `/api/stream/audio?url=${encodeURIComponent(audioUrl)}`;
-        }
-        room.audioState = { audioUrl: finalUrl, startTime, offset, playing: true, loop: !!loop };
+        const startTime = Date.now() + 2000; // Server-side sync point
+        room.audioState = { audioUrl, startTime, offset, playing: true, loop: !!loop };
         io.to(roomKey).emit("audio-play", room.audioState);
       }
     });
@@ -202,15 +175,23 @@ async function startServer() {
       }
     });
 
-    socket.on("seek-audio", ({ roomKey, offset, startTime, loop }) => {
+    socket.on("seek-audio", ({ roomKey, offset, loop }) => {
       const room = rooms.get(roomKey);
       if (room && room.hostId === socket.id) {
+        const startTime = Date.now() + 500; // Short delay for seek
         if (room.audioState) {
           room.audioState.offset = offset;
           room.audioState.startTime = startTime;
           if (loop !== undefined) room.audioState.loop = loop;
         }
         io.to(roomKey).emit("audio-seek", { offset, startTime, loop: room.audioState?.loop });
+      }
+    });
+
+    socket.on("request-sync", (roomKey) => {
+      const room = rooms.get(roomKey);
+      if (room && room.audioState) {
+        socket.emit("audio-play", room.audioState);
       }
     });
 
