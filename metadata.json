@@ -1,0 +1,5 @@
+{
+  "name": "SonicSync",
+  "description": "Synchronized multi-device music player with master clock sync.",
+  "requestFramePermissions": []
+}
