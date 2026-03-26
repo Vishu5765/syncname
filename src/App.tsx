@@ -28,6 +28,8 @@ export default function App() {
   const [isLooping, setIsLooping] = useState(false);
   const [userList, setUserList] = useState<[string, string][]>([]);
   const [showUserList, setShowUserList] = useState(false);
+  const [audioLibrary, setAudioLibrary] = useState<string[]>([]);
+  const [showLibrary, setShowLibrary] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [audioSuspended, setAudioSuspended] = useState(false);
@@ -81,6 +83,15 @@ export default function App() {
     socketRef.current.on("audio-seek", ({ offset, startTime, loop }) => {
       if (loop !== undefined) setIsLooping(loop);
       handleRemoteSeek(offset, startTime, loop);
+    });
+
+    socketRef.current.on("library-update", (list) => {
+      setAudioLibrary(list);
+    });
+
+    socketRef.current.on("audio-next", ({ audioUrl, startTime, offset, loop }) => {
+      setIsLooping(!!loop);
+      handleRemotePlay(audioUrl, startTime, offset, !!loop);
     });
 
     const syncInterval = setInterval(syncClock, 5000);
@@ -155,6 +166,13 @@ export default function App() {
     source.loop = loop;
     source.connect(audioContextRef.current.destination);
     
+    source.onended = () => {
+      if (!loop && role === "main") {
+        // Host triggers next song if loop is OFF
+        playNextTrack();
+      }
+    };
+
     const nowServer = getServerTime();
     const delay = (startTime - nowServer) / 1000;
     const targetTime = audioContextRef.current.currentTime + delay;
@@ -224,6 +242,14 @@ export default function App() {
     socketRef.current?.emit("kill-user", { roomKey, targetId });
   };
 
+  const playNextTrack = () => {
+    if (audioLibrary.length === 0) return;
+    const currentIndex = audioLibrary.indexOf(audioUrl);
+    const nextIndex = (currentIndex + 1) % audioLibrary.length;
+    const nextUrl = audioLibrary[nextIndex];
+    socketRef.current?.emit("play-audio", { roomKey, audioUrl: nextUrl, offset: 0, loop: isLooping });
+  };
+
   const hostPlay = () => {
     if (!audioUrl) return;
     socketRef.current?.emit("play-audio", { roomKey, audioUrl, offset: 0, loop: isLooping });
@@ -264,6 +290,7 @@ export default function App() {
           try {
             const data = JSON.parse(xhr.responseText);
             setAudioUrl(data.url);
+            socketRef.current?.emit("add-to-library", { roomKey, url: data.url });
             setUploading(false);
           } catch (e) {
             setError("Server returned invalid response.");
@@ -447,7 +474,7 @@ export default function App() {
                       </button>
                       <button 
                         onClick={toggleLoop} 
-                        className={`${BRUTAL_CLASSES.button} ${isLooping ? "bg-[#141414] text-white" : ""}`}
+                        className={`${BRUTAL_CLASSES.button} ${isLooping ? "bg-[#141414] text-white" : "bg-white text-[#141414]"}`}
                         title="Toggle Loop"
                       >
                         <RotateCcw size={20} />
@@ -468,15 +495,20 @@ export default function App() {
                 </div>
 
                 {role === "main" && (
-                  <input 
-                    type="range" 
-                    className="w-full accent-[#141414]" 
-                    min="0" 
-                    max={audioBufferRef.current?.duration || 100} 
-                    step="0.1"
-                    value={currentOffsetRef.current + (isPlaying ? (getServerTime() - lastPlayTimeRef.current) / 1000 : 0)}
-                    onChange={(e) => hostSeek(parseFloat(e.target.value))}
-                  />
+                  <div className="space-y-4 mt-4">
+                    <input 
+                      type="range" 
+                      className="w-full accent-[#141414]" 
+                      min="0" 
+                      max={audioBufferRef.current?.duration || 100} 
+                      step="0.1"
+                      value={currentOffsetRef.current + (isPlaying ? (getServerTime() - lastPlayTimeRef.current) / 1000 : 0)}
+                      onChange={(e) => hostSeek(parseFloat(e.target.value))}
+                    />
+                    <button onClick={() => setShowLibrary(true)} className={`${BRUTAL_CLASSES.button} w-full`}>
+                      <Music size={16} /> Open Library ({audioLibrary.length})
+                    </button>
+                  </div>
                 )}
               </div>
             </div>
@@ -568,6 +600,49 @@ export default function App() {
                         <Skull size={12} /> Kill
                       </button>
                     )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Library Modal */}
+        {showLibrary && (
+          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+            <div className={`${BRUTAL_CLASSES.card} w-full max-w-md mb-0`}>
+              <div className="flex justify-between items-center mb-6 border-b-2 border-[#141414] pb-2">
+                <h2 className="text-2xl font-black uppercase">Audio Library</h2>
+                <button onClick={() => setShowLibrary(false)}><X size={24} /></button>
+              </div>
+              <div className="space-y-2 max-h-[60vh] overflow-y-auto">
+                {audioLibrary.length === 0 && <p className="text-xs opacity-50 italic">No files uploaded yet.</p>}
+                {audioLibrary.map((url) => (
+                  <div key={url} className={`flex justify-between items-center p-2 border border-[#141414] hover:bg-gray-50 ${audioUrl === url ? "bg-gray-100 border-l-4 border-l-[#141414]" : ""}`}>
+                    <div className="flex items-center gap-2 overflow-hidden">
+                      <Music size={14} />
+                      <span className="font-bold truncate text-xs">{url.split('/').pop()?.split('-').slice(1).join('-')}</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <button 
+                        onClick={() => {
+                          setAudioUrl(url);
+                          socketRef.current?.emit("play-audio", { roomKey, audioUrl: url, offset: 0, loop: isLooping });
+                          setShowLibrary(false);
+                        }} 
+                        className={BRUTAL_CLASSES.button + " text-[10px] py-1"}
+                      >
+                        Play
+                      </button>
+                      <button 
+                        onClick={() => {
+                          socketRef.current?.emit("remove-from-library", { roomKey, url });
+                        }} 
+                        className={BRUTAL_CLASSES.killButton}
+                      >
+                        <X size={12} />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>

@@ -74,6 +74,7 @@ async function startServer() {
     audioState: any; 
     users: Map<string, string>; 
     banned: Set<string>;
+    library: string[];
   }>();
 
   io.on("connection", (socket) => {
@@ -100,7 +101,8 @@ async function startServer() {
         locked: false, 
         audioState: null, 
         users, 
-        banned: new Set() 
+        banned: new Set(),
+        library: []
       });
       socket.join(roomKey);
       socket.emit("room-created", { roomKey, username: username || "Host" });
@@ -188,10 +190,21 @@ async function startServer() {
       }
     });
 
-    socket.on("request-sync", (roomKey) => {
+    socket.on("add-to-library", ({ roomKey, url }) => {
       const room = rooms.get(roomKey);
-      if (room && room.audioState) {
-        socket.emit("audio-play", room.audioState);
+      if (room && room.hostId === socket.id) {
+        if (!room.library.includes(url)) {
+          room.library.push(url);
+        }
+        socket.emit("library-update", room.library);
+      }
+    });
+
+    socket.on("remove-from-library", ({ roomKey, url }) => {
+      const room = rooms.get(roomKey);
+      if (room && room.hostId === socket.id) {
+        room.library = room.library.filter(item => item !== url);
+        socket.emit("library-update", room.library);
       }
     });
 
